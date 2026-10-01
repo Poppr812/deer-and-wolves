@@ -1,6 +1,9 @@
 # Deer and Wolves
 
-A predator-prey game based on a summer-camp field game, in a single HTML file
+A children's playground game like Red Rover, Red Rover — turned into a
+predator-prey simulation.
+
+It's built from a summer-camp field game, in a single HTML file
 with no dependencies or build step. It runs on any phone, tablet, or computer
 with a browser.
 
