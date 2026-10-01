@@ -1,0 +1,697 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+<title>Deer and Wolves</title>
+<style>
+  :root{
+    --bg:#f4f1e8;
+    --field:#dfe8cf;
+    --line:#5a6b4a;
+    --text:#1f2a1f;
+    --deer:#8b5e3c;
+    --wolf:#4a4f57;
+    --player:#1f6feb;
+    --safe:#c8dcc0;
+    --danger:#ead6d1;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;
+    font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+    background:var(--bg);
+    color:var(--text);
+  }
+  .wrap{
+    max-width:980px;
+    margin:0 auto;
+    padding:16px;
+  }
+  h1{margin:0 0 6px;font-size:28px}
+  .sub{margin:0 0 14px;color:#4c574c}
+  .hud{
+    display:flex;
+    gap:10px;
+    flex-wrap:wrap;
+    align-items:center;
+    margin-bottom:10px;
+  }
+  .pill{
+    background:white;
+    border:1px solid #c9c9c2;
+    border-radius:999px;
+    padding:7px 11px;
+    font-weight:600;
+  }
+  .pill.you-deer{color:#8b5e3c}
+  .pill.you-wolf{color:#4a4f57}
+  button{
+    border:1px solid #999;
+    background:white;
+    border-radius:10px;
+    padding:10px 14px;
+    font-size:16px;
+    cursor:pointer;
+  }
+  button:active{transform:translateY(1px)}
+  button:disabled{opacity:.45;cursor:default;transform:none}
+  #start{border-color:#1f6feb;color:#1f6feb;font-weight:700}
+  .toggle{
+    display:inline-flex;
+    align-items:center;
+    gap:6px;
+    background:white;
+    border:1px solid #c9c9c2;
+    border-radius:999px;
+    padding:6px 12px;
+    font-size:14px;
+    cursor:pointer;
+    user-select:none;
+  }
+  .toggle input{margin:0;cursor:pointer}
+  #game{
+    width:100%;
+    aspect-ratio:16/9;
+    display:block;
+    border:2px solid var(--line);
+    border-radius:14px;
+    background:var(--field);
+    touch-action:none;
+  }
+  .help{
+    margin-top:10px;
+    font-size:14px;
+    color:#4c574c;
+  }
+  .history{
+    margin-top:16px;
+    background:white;
+    border:1px solid #c9c9c2;
+    border-radius:12px;
+    padding:12px;
+  }
+  .chartnote{
+    margin:4px 0 0;
+    font-size:13px;
+    color:#4c574c;
+  }
+  canvas{user-select:none;-webkit-user-select:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Deer and Wolves</h1>
+  <p class="sub">Cross the field without getting tagged. Tagged deer become wolves next round. Wolves that catch nobody become deer.</p>
+
+  <div class="hud">
+    <div class="pill" id="round">Round 1</div>
+    <div class="pill" id="deerCount">Deer: 18</div>
+    <div class="pill" id="wolfCount">Wolves: 3</div>
+    <div class="pill you-deer" id="youAre">You: Deer</div>
+    <div class="pill" id="status">Press Start</div>
+    <button id="start">Start</button>
+    <button id="pause">Pause</button>
+    <button id="restart">Restart</button>
+    <label class="toggle"><input type="checkbox" id="autostart" /> Auto-start rounds (2s)</label>
+  </div>
+
+  <canvas id="game" width="960" height="540" aria-label="Deer and Wolves game field"></canvas>
+
+  <div class="help">
+    Mouse: click and hold, then drag. Touchscreen: drag with your finger. Keyboard: WASD or arrow keys.
+    You are outlined in blue. As a deer, reach the opposite side. As a wolf, tag one deer &mdash; then your hunt is over for the round.
+  </div>
+
+  <div class="history">
+    <strong>Population</strong>
+    <p class="chartnote">The shaded band is where each population usually sits. Watch the bars leave it &mdash; and come back.</p>
+    <canvas id="chart" width="920" height="250" style="width:100%;height:250px;display:block;margin-top:4px"></canvas>
+  </div>
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const chart = document.getElementById('chart');
+  const cctx = chart.getContext('2d');
+
+  const roundEl = document.getElementById('round');
+  const deerEl = document.getElementById('deerCount');
+  const wolfEl = document.getElementById('wolfCount');
+  const youEl = document.getElementById('youAre');
+  const statusEl = document.getElementById('status');
+  const startBtn = document.getElementById('start');
+  const restartBtn = document.getElementById('restart');
+  const pauseBtn = document.getElementById('pause');
+  const autoBox = document.getElementById('autostart');
+
+  const W = canvas.width, H = canvas.height;
+  const margin = 34;
+  const totalAgents = 21;      // odd total: never an even split
+  const startingWolves = 3;
+  const roundDuration = 11.0;
+  const deerSpeed = 145;
+  const wolfSpeed = 128;
+  const playerSpeed = 560;     // player is unconstrained by AI pacing
+  const tagDistance = 18;
+  const autoStartDelay = 2000;
+
+  let agents = [];
+  let round = 1;
+  let elapsed = 0;
+  let running = false;
+  let awaitingStart = true;
+  let pointerActive = false;
+  let target = {x: margin+10, y:H/2};
+  let direction = 1; // 1 left->right, -1 right->left
+  let lastTime = performance.now();
+  let roundEnding = false;
+  let history = [];
+  let autoTimer = null;
+  const keys = new Set();
+
+  function rand(a,b){ return a + Math.random()*(b-a); }
+  function clamp(v,a,b){ return Math.max(a,Math.min(b,v)); }
+  function dist(a,b){ return Math.hypot(a.x-b.x,a.y-b.y); }
+
+  function startPositions(type, idx, count) {
+    const x = direction===1 ? margin : W-margin;
+    const spacing = (H-2*margin)/(Math.max(1,count));
+    const y = margin + spacing*(idx+0.5) + rand(-8,8);
+    return {x:x+rand(-8,8), y:clamp(y, margin, H-margin)};
+  }
+
+  function setupGame() {
+    if(autoTimer){ clearTimeout(autoTimer); autoTimer=null; }
+    agents = [];
+    direction = 1;
+    round = 1;
+    elapsed = 0;
+    running = false;
+    awaitingStart = true;
+    roundEnding = false;
+    keys.clear();
+    pauseBtn.textContent = 'Pause';
+
+    for(let i=0;i<totalAgents;i++){
+      agents.push({
+        id:i,
+        type: i<startingWolves ? 'wolf' : 'deer',
+        player: i===startingWolves,   // the player starts as the first deer
+        x:0,y:0,vx:0,vy:0,
+        caught:false,
+        caughtBy:null,
+        catches:0,
+        crossed:false
+      });
+    }
+    history = [];
+    positionForRound();
+    saveHistory();
+    updateHud();
+    statusEl.textContent = 'Press Start';
+  }
+
+  function positionForRound(){
+    const deer = agents.filter(a=>a.type==='deer');
+    const wolves = agents.filter(a=>a.type==='wolf');
+
+    deer.forEach((a,i)=>{
+      const p = startPositions('deer',i,deer.length);
+      a.x=p.x; a.y=p.y; a.vx=a.vy=0;
+      a.caught=false; a.caughtBy=null; a.crossed=false; a.catches=0;
+    });
+    wolves.forEach((a,i)=>{
+      a.x = W/2 + rand(-70,70);
+      a.y = margin + (H-2*margin)*(i+0.5)/wolves.length + rand(-15,15);
+      a.vx=a.vy=0; a.catches=0; a.crossed=false; a.caught=false;
+    });
+
+    const player = agents.find(a=>a.player);
+    if(player) target={x:player.x,y:player.y};
+  }
+
+  function saveHistory(){
+    history.push({
+      round,
+      deer: agents.filter(a=>a.type==='deer').length,
+      wolves: agents.filter(a=>a.type==='wolf').length
+    });
+  }
+
+  function updateHud(){
+    const deer = agents.filter(a=>a.type==='deer').length;
+    const wolves = agents.filter(a=>a.type==='wolf').length;
+    const player = agents.find(a=>a.player);
+    roundEl.textContent = `Round ${round}`;
+    deerEl.textContent = `Deer: ${deer}`;
+    wolfEl.textContent = `Wolves: ${wolves}`;
+    if(player){
+      const isDeer = player.type==='deer';
+      youEl.textContent = isDeer ? 'You: Deer' : 'You: Wolf';
+      youEl.className = 'pill ' + (isDeer ? 'you-deer' : 'you-wolf');
+    }
+    startBtn.textContent = round===1 && history.length<=1 ? 'Start' : 'Next Round';
+    startBtn.disabled = !awaitingStart;
+    pauseBtn.disabled = awaitingStart;
+  }
+
+  function pointerPos(e){
+    const r=canvas.getBoundingClientRect();
+    return {
+      x:(e.clientX-r.left)*W/r.width,
+      y:(e.clientY-r.top)*H/r.height
+    };
+  }
+
+  canvas.addEventListener('pointerdown', e=>{
+    pointerActive=true;
+    canvas.setPointerCapture(e.pointerId);
+    target=pointerPos(e);
+  });
+  canvas.addEventListener('pointermove', e=>{
+    if(pointerActive) target=pointerPos(e);
+  });
+  canvas.addEventListener('pointerup', e=>{
+    pointerActive=false;
+    try{canvas.releasePointerCapture(e.pointerId)}catch{}
+  });
+  canvas.addEventListener('pointercancel', ()=>pointerActive=false);
+
+  const moveKeys = new Set(['arrowup','arrowdown','arrowleft','arrowright','w','a','s','d']);
+  window.addEventListener('keydown', e=>{
+    const k = e.key.toLowerCase();
+    if(moveKeys.has(k)){ keys.add(k); e.preventDefault(); }
+  });
+  window.addEventListener('keyup', e=>{
+    keys.delete(e.key.toLowerCase());
+  });
+  window.addEventListener('blur', ()=>keys.clear());
+
+  startBtn.addEventListener('click', ()=>{ if(awaitingStart) beginRound(); });
+  restartBtn.addEventListener('click', setupGame);
+  pauseBtn.addEventListener('click', ()=>{
+    if(awaitingStart) return;
+    running=!running;
+    pauseBtn.textContent = running ? 'Pause' : 'Resume';
+    statusEl.textContent = running ? 'Go!' : 'Paused';
+  });
+  autoBox.addEventListener('change', ()=>{
+    if(autoBox.checked && awaitingStart && !roundEnding) return; // don't auto-launch a round you haven't started
+    if(!autoBox.checked && autoTimer){ clearTimeout(autoTimer); autoTimer=null; }
+  });
+
+  function beginRound(){
+    if(autoTimer){ clearTimeout(autoTimer); autoTimer=null; }
+    positionForRound();
+    elapsed = 0;
+    awaitingStart = false;
+    roundEnding = false;
+    running = true;
+    pauseBtn.textContent = 'Pause';
+    statusEl.textContent = 'Go!';
+    updateHud();
+  }
+
+  function moveToward(a,tx,ty,speed,dt){
+    const dx=tx-a.x, dy=ty-a.y;
+    const d=Math.hypot(dx,dy)||1;
+    a.vx=(dx/d)*speed;
+    a.vy=(dy/d)*speed;
+    a.x += a.vx*dt;
+    a.y += a.vy*dt;
+  }
+
+  function movePlayer(a,dt){
+    let kx=0, ky=0;
+    if(keys.has('arrowleft')||keys.has('a')) kx-=1;
+    if(keys.has('arrowright')||keys.has('d')) kx+=1;
+    if(keys.has('arrowup')||keys.has('w')) ky-=1;
+    if(keys.has('arrowdown')||keys.has('s')) ky+=1;
+
+    if(kx||ky){
+      const m=Math.hypot(kx,ky);
+      a.x = clamp(a.x + (kx/m)*playerSpeed*dt, margin, W-margin);
+      a.y = clamp(a.y + (ky/m)*playerSpeed*dt, margin, H-margin);
+      target = {x:a.x, y:a.y};
+      return;
+    }
+
+    const tx = clamp(target.x, margin, W-margin);
+    const ty = clamp(target.y, margin, H-margin);
+    const dx = tx-a.x, dy = ty-a.y;
+    const d = Math.hypot(dx,dy);
+    const step = playerSpeed*dt;
+    if(d<=step){ a.x=tx; a.y=ty; }          // snap when within reach: no drift, no jitter
+    else { a.x += dx/d*step; a.y += dy/d*step; }
+  }
+
+  function update(dt){
+    if(!running || roundEnding || awaitingStart) return;
+    elapsed += dt;
+
+    const deer = agents.filter(a=>a.type==='deer' && !a.caught && !a.crossed);
+    const wolves = agents.filter(a=>a.type==='wolf');
+
+    for(const a of deer){
+      if(a.player){
+        movePlayer(a,dt);
+      }else{
+        const goalX = direction===1 ? W-margin : margin;
+        let gy = a.y;
+        let nearest=null, nd=Infinity;
+        for(const w of wolves){
+          const d=dist(a,w);
+          if(d<nd){nd=d;nearest=w;}
+        }
+        if(nearest && nd<100){
+          gy += (a.y-nearest.y)*1.5;
+        } else {
+          gy += rand(-25,25);
+        }
+        moveToward(a,goalX,clamp(gy,margin,H-margin),deerSpeed,dt);
+      }
+
+      if((direction===1 && a.x>=W-margin-2) || (direction===-1 && a.x<=margin+2)){
+        a.crossed=true;
+      }
+    }
+
+    for(const w of wolves){
+      if(w.catches>=1) continue; // one catch max per round, player included
+
+      if(w.player){
+        movePlayer(w,dt);
+        let prey=null, nd=Infinity;
+        for(const d of deer){
+          if(d.caught || d.crossed) continue;
+          const dd=dist(w,d);
+          if(dd<nd){nd=dd;prey=d;}
+        }
+        if(prey && nd<tagDistance){
+          prey.caught=true;
+          prey.caughtBy=w.id;
+          w.catches=1;
+          prey.vx=prey.vy=0;
+          statusEl.textContent='You made your catch — hunt over for this round.';
+        }
+        continue;
+      }
+
+      let targetDeer=null, nd=Infinity;
+      for(const d of deer){
+        if(d.caught || d.crossed) continue;
+        const dd=dist(w,d);
+        if(dd<nd){nd=dd;targetDeer=d;}
+      }
+      if(targetDeer){
+        moveToward(w,targetDeer.x,targetDeer.y,wolfSpeed,dt);
+        if(dist(w,targetDeer)<tagDistance){
+          targetDeer.caught=true;
+          targetDeer.caughtBy=w.id;
+          w.catches=1;
+          targetDeer.vx=targetDeer.vy=0;
+        }
+      }
+    }
+
+    const activeDeer = agents.filter(a=>a.type==='deer' && !a.caught && !a.crossed);
+    if(elapsed>=roundDuration || activeDeer.length===0){
+      endRound();
+    }
+  }
+
+  function endRound(){
+    roundEnding=true;
+    running=false;
+
+    const player = agents.find(a=>a.player);
+    const wasPlayerDeer = player && player.type==='deer';
+    const playerCaught = wasPlayerDeer && player.caught;
+    const playerFedWolf = player && player.type==='wolf' && player.catches>0;
+
+    const toWolf = new Set(
+      agents.filter(a=>a.type==='deer' && a.caught).map(a=>a.id)
+    );
+    const toDeer = new Set(
+      agents.filter(a=>a.type==='wolf' && a.catches===0).map(a=>a.id)
+    );
+
+    // A population with no predators can never recover: one hungry wolf hangs on.
+    if(toWolf.size===0 && toDeer.size===agents.filter(a=>a.type==='wolf').length && toDeer.size>0){
+      const survivors=[...toDeer];
+      toDeer.delete(survivors[Math.floor(Math.random()*survivors.length)]);
+    }
+
+    for(const a of agents){
+      if(toWolf.has(a.id)) a.type='wolf';
+      else if(toDeer.has(a.id)) a.type='deer';
+    }
+
+    round++;
+    direction *= -1;
+    elapsed=0;
+    saveHistory();
+    awaitingStart=true;
+    updateHud();
+
+    if(playerCaught){
+      statusEl.textContent='You were tagged — you hunt as a wolf next round.';
+    }else if(wasPlayerDeer){
+      statusEl.textContent='You survived — you stay a deer.';
+    }else if(playerFedWolf){
+      statusEl.textContent='You ate — you stay a wolf.';
+    }else{
+      statusEl.textContent='You caught nothing — you are a deer next round.';
+    }
+
+    if(autoBox.checked){
+      autoTimer=setTimeout(()=>{ autoTimer=null; beginRound(); }, autoStartDelay);
+    }
+  }
+
+  function drawField(){
+    ctx.clearRect(0,0,W,H);
+    ctx.fillStyle=getComputedStyle(document.documentElement).getPropertyValue('--field');
+    ctx.fillRect(0,0,W,H);
+
+    ctx.fillStyle='#c8dcc0';
+    ctx.fillRect(0,0,margin,H);
+    ctx.fillRect(W-margin,0,margin,H);
+
+    ctx.strokeStyle='#5a6b4a';
+    ctx.lineWidth=2;
+    ctx.setLineDash([8,8]);
+    ctx.beginPath(); ctx.moveTo(margin,0); ctx.lineTo(margin,H); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(W-margin,0); ctx.lineTo(W-margin,H); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  function drawAgent(a){
+    ctx.save();
+    ctx.translate(a.x,a.y);
+
+    if(a.type==='deer'){
+      ctx.fillStyle = a.caught ? '#b98b72' : '#8b5e3c';
+      ctx.beginPath(); ctx.arc(0,0,10,0,Math.PI*2); ctx.fill();
+      ctx.fillStyle='#6f462c';
+      ctx.fillRect(-3,-14,2,6);
+      ctx.fillRect(3,-14,2,6);
+    } else {
+      ctx.fillStyle = a.catches>=1 ? '#7b828c' : '#4a4f57';
+      ctx.beginPath();
+      ctx.moveTo(-11,8); ctx.lineTo(12,0); ctx.lineTo(-9,-9); ctx.closePath(); ctx.fill();
+    }
+
+    if(a.player){
+      ctx.strokeStyle='#1f6feb';
+      ctx.lineWidth=3;
+      ctx.beginPath(); ctx.arc(0,0,16,0,Math.PI*2); ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function draw(){
+    drawField();
+
+    ctx.fillStyle='#334233';
+    ctx.font='16px system-ui';
+    ctx.textAlign='center';
+    ctx.fillText(direction===1 ? 'RUN →' : '← RUN', W/2, 26);
+
+    for(const a of agents) drawAgent(a);
+
+    if(awaitingStart){
+      ctx.fillStyle='rgba(255,255,255,.86)';
+      ctx.fillRect(W/2-150,H/2-26,300,52);
+      ctx.strokeStyle='#1f6feb';
+      ctx.lineWidth=2;
+      ctx.strokeRect(W/2-150,H/2-26,300,52);
+      ctx.fillStyle='#1f2a1f';
+      ctx.font='600 20px system-ui';
+      ctx.fillText(round===1 && history.length<=1 ? 'Press Start' : `Press Next Round  ·  Round ${round}`, W/2, H/2+7);
+    } else if(running && !roundEnding){
+      const remain=Math.max(0,roundDuration-elapsed);
+      ctx.fillStyle='rgba(255,255,255,.88)';
+      ctx.fillRect(W/2-42,H-42,84,26);
+      ctx.fillStyle='#222';
+      ctx.font='14px system-ui';
+      ctx.fillText(remain.toFixed(1)+' s',W/2,H-24);
+    }
+  }
+
+  // Everything the chart knows about one population, over every round played.
+  function stats(key){
+    const v = history.map(h=>h[key]);
+    const n = v.length;
+    const mean = v.reduce((a,b)=>a+b,0)/n;
+    const sd = Math.sqrt(v.reduce((a,b)=>a+(b-mean)*(b-mean),0)/n);
+    return {cur:v[n-1], max:Math.max(...v), min:Math.min(...v), mean, sd, n};
+  }
+
+  const CHART_H = 250;
+
+  function drawChart(){
+    const r=chart.getBoundingClientRect();
+    const dpr=window.devicePixelRatio||1;
+    const wantW=Math.max(300,Math.floor(r.width*dpr));
+    const wantH=Math.floor(CHART_H*dpr);
+    if(chart.width!==wantW || chart.height!==wantH){
+      chart.width=wantW;
+      chart.height=wantH;
+    }
+    cctx.setTransform(dpr,0,0,dpr,0,0);
+
+    const cw=r.width, ch=CHART_H;
+    const padTop=20, axisX=34;
+
+    // Lay the plain-language key out first: on a narrow screen it wraps to a
+    // second line, and the plot has to give up the height to make room.
+    cctx.font='11px system-ui';
+    const SWATCH=16, GAP=6, ITEMPAD=14;
+    const avail=cw-axisX-10;
+    const keyRows=[[]];
+    let rowW=0;
+    for(const t of ['most ever','fewest ever','usual range']){
+      const w=SWATCH+GAP+cctx.measureText(t).width;
+      if(rowW>0 && rowW+ITEMPAD+w>avail){ keyRows.push([]); rowW=0; }
+      keyRows[keyRows.length-1].push({t,w});
+      rowW += (rowW?ITEMPAD:0)+w;
+    }
+
+    const padBottom=38+keyRows.length*15;
+    const base=ch-padBottom, top=padTop, plotH=base-top;
+    const y=v=>base-plotH*(v/totalAgents);
+
+    cctx.clearRect(0,0,cw,ch);
+
+    // axis
+    cctx.strokeStyle='#d0d0ca';
+    cctx.lineWidth=1;
+    cctx.beginPath();
+    cctx.moveTo(axisX,top-6); cctx.lineTo(axisX,base); cctx.lineTo(cw-10,base);
+    cctx.stroke();
+    cctx.fillStyle='#777';
+    cctx.font='11px system-ui';
+    cctx.textAlign='right';
+    cctx.fillText(String(totalAgents),axisX-5,y(totalAgents)+4);
+    cctx.fillText('0',axisX-5,base+4);
+
+    const barW = clamp((cw-axisX)*0.16, 40, 92);
+    const cols = [
+      {key:'deer',   label:'DEER',   x: axisX + (cw-axisX)*0.28, solid:'#8b5e3c', band:'rgba(139,94,60,.20)', dark:'#5f3c22'},
+      {key:'wolves', label:'WOLVES', x: axisX + (cw-axisX)*0.68, solid:'#4a4f57', band:'rgba(74,79,87,.20)',  dark:'#2c3037'}
+    ];
+
+    for(const c of cols){
+      const s = stats(c.key);
+      const L = c.x-barW/2, R = c.x+barW/2;
+
+      // usual range: mean +/- 1 SD. Meaningless until a few rounds exist.
+      if(s.n>=3){
+        const hi=clamp(s.mean+s.sd,0,totalAgents), lo=clamp(s.mean-s.sd,0,totalAgents);
+        cctx.fillStyle=c.band;
+        cctx.fillRect(L-10, y(hi), barW+20, Math.max(2,y(lo)-y(hi)));
+        cctx.strokeStyle=c.dark;
+        cctx.globalAlpha=.45;
+        cctx.lineWidth=1;
+        cctx.setLineDash([4,4]);
+        cctx.beginPath(); cctx.moveTo(L-10,y(hi)); cctx.lineTo(R+10,y(hi)); cctx.stroke();
+        cctx.beginPath(); cctx.moveTo(L-10,y(lo)); cctx.lineTo(R+10,y(lo)); cctx.stroke();
+        cctx.setLineDash([]);
+        cctx.globalAlpha=1;
+      }
+
+      // the bar
+      cctx.fillStyle=c.solid;
+      const bh=Math.max(0,base-y(s.cur));
+      cctx.fillRect(L, y(s.cur), barW, bh);
+
+      // most ever / fewest ever
+      if(s.n>=2){
+        cctx.strokeStyle=c.dark;
+        cctx.lineWidth=2.5;
+        for(const [val,dir] of [[s.max,-1],[s.min,1]]){
+          cctx.beginPath();
+          cctx.moveTo(L-13, y(val)); cctx.lineTo(R+13, y(val));
+          cctx.stroke();
+          cctx.fillStyle=c.dark;
+          cctx.font='600 11px system-ui';
+          cctx.textAlign='left';
+          cctx.fillText(String(val), R+17, y(val)+(dir<0?-1:9));
+        }
+      }
+
+      // current count, above the bar
+      cctx.fillStyle=c.dark;
+      cctx.font='700 20px system-ui';
+      cctx.textAlign='center';
+      cctx.fillText(String(s.cur), c.x, Math.max(top+14, y(s.cur)-8));
+
+      cctx.fillStyle='#555';
+      cctx.font='600 12px system-ui';
+      cctx.fillText(c.label, c.x, base+18);
+    }
+
+    // plain-language key
+    cctx.textAlign='left';
+    cctx.font='11px system-ui';
+    keyRows.forEach((row,ri)=>{
+      const ky=ch-14-(keyRows.length-1-ri)*15;
+      let kx=axisX+4;
+      for(const it of row){
+        if(it.t==='usual range'){
+          cctx.fillStyle='rgba(90,90,90,.22)';
+          cctx.fillRect(kx,ky-11,SWATCH,12);
+        }else{
+          cctx.strokeStyle='#444';
+          cctx.lineWidth=2.5;
+          cctx.beginPath();
+          cctx.moveTo(kx,ky-4); cctx.lineTo(kx+SWATCH,ky-4);
+          cctx.stroke();
+        }
+        cctx.fillStyle='#555';
+        cctx.fillText(it.t, kx+SWATCH+GAP, ky);
+        kx += it.w + ITEMPAD;
+      }
+    });
+  }
+
+  function loop(now){
+    const dt=Math.min(.035,(now-lastTime)/1000);
+    lastTime=now;
+    update(dt);
+    draw();
+    drawChart();
+    requestAnimationFrame(loop);
+  }
+
+  window.addEventListener('resize',drawChart);
+  setupGame();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

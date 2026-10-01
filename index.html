@@ -1,0 +1,1451 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+<title>Deer and Wolves</title>
+<style>
+  :root{
+    --bg:#efe9dd;
+    --card:#fbf8f1;
+    --ink:#20281d;
+    --ink-soft:#5d6455;
+    --rule:#d8d1c0;
+    --deer:#9a6b42;
+    --deer-dark:#63401f;
+    --wolf:#525863;
+    --wolf-dark:#2d323b;
+    --player:#1f6feb;
+    --display:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,"Times New Roman",serif;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;
+    font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+    background:var(--bg);
+    color:var(--ink);
+  }
+  .wrap{max-width:980px;margin:0 auto;padding:18px 16px 28px}
+  h1{
+    font-family:var(--display);
+    font-weight:600;
+    font-size:34px;
+    letter-spacing:.01em;
+    margin:0 0 4px;
+  }
+  .sub{margin:0 0 16px;color:var(--ink-soft);font-size:15px;max-width:60ch}
+  .hud{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+  .pill{
+    background:var(--card);
+    border:1px solid var(--rule);
+    border-radius:999px;
+    padding:7px 13px;
+    font-size:14px;
+    font-weight:600;
+    color:var(--ink-soft);
+  }
+  .pill b{font-family:var(--display);font-size:16px;color:var(--ink)}
+  .pill.you-deer b{color:var(--deer-dark)}
+  .pill.you-wolf b{color:var(--wolf-dark)}
+  button{
+    font:inherit;
+    font-weight:600;
+    border:1px solid var(--rule);
+    background:var(--card);
+    color:var(--ink);
+    border-radius:10px;
+    padding:9px 16px;
+    cursor:pointer;
+    transition:transform .06s,box-shadow .12s;
+  }
+  button:hover:not(:disabled){box-shadow:0 1px 4px rgba(0,0,0,.10)}
+  button:active:not(:disabled){transform:translateY(1px)}
+  button:disabled{opacity:.4;cursor:default}
+  #start{
+    background:var(--wolf-dark);
+    border-color:var(--wolf-dark);
+    color:#f6f2e8;
+  }
+  .toggle{
+    display:inline-flex;align-items:center;gap:7px;
+    background:var(--card);border:1px solid var(--rule);border-radius:999px;
+    padding:7px 13px;font-size:13px;color:var(--ink-soft);cursor:pointer;user-select:none;
+  }
+  .toggle input{margin:0;cursor:pointer}
+  #game{
+    width:100%;
+    aspect-ratio:16/9;
+    display:block;
+    border-radius:12px;
+    box-shadow:0 2px 10px rgba(40,35,25,.16), 0 0 0 1px rgba(60,70,50,.22);
+    touch-action:none;
+    background:#c9d2a8;
+  }
+  .help{margin-top:12px;font-size:13.5px;color:var(--ink-soft);max-width:68ch;line-height:1.5}
+  .history{
+    margin-top:18px;
+    background:var(--card);
+    border:1px solid var(--rule);
+    border-radius:12px;
+    padding:14px 14px 8px;
+  }
+  .history strong{font-family:var(--display);font-size:18px;font-weight:600}
+  .chartnote{margin:5px 0 0;font-size:13px;color:var(--ink-soft)}
+  canvas{user-select:none;-webkit-user-select:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <canvas id="game" width="960" height="540" aria-label="Deer and Wolves game field"></canvas>
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  const W = canvas.width, H = canvas.height;
+
+  // The scoreboard lives inside the canvas, so the canvas is the whole product.
+  const STRIP_H = 34;            // round and clock only; the counts live on the bars
+  const CTRL_W = 170;            // right end of the strip, reserved for controls
+  const fieldTop = STRIP_H;
+  const padY = 24;               // vertical inset for animals inside the field
+  const yMin = fieldTop + padY, yMax = H - padY;
+
+  const margin = 95;             // the woods at each end, holding the distribution panels
+  const totalAgents = 21;      // odd total: never an even split
+  const startingWolves = 3;
+  const tagDistance = 18;
+  const autoStartDelay = 2000;
+
+  /* ---- feel of a round. These numbers are the gameplay; tune them here. ---- */
+  const COUNTDOWN     = 2.6;   // seconds of 3-2-1 before anyone may move
+  const roundDuration = 14.0;  // the clock starts after the countdown, not before
+
+  // Everyone is a child on a field: same body, same handling. Only legs differ,
+  // spread evenly from the slowest to the fastest. You are the second fastest,
+  // so exactly one animal out there can outrun you. Speed is a lifelong trait,
+  // so a fast deer becomes a fast wolf.
+  const SPEED_TOP     = 200;
+  const SPEED_FLOOR   = SPEED_TOP*0.75;
+
+  // The same turn rate for everybody. It has to be finite or nobody can ever be
+  // outmanoeuvred: a wolf that commits hard at a deer and guesses wrong has to
+  // be able to sail past it, which is where most escapes come from.
+  const TURN          = 6.0;   // radians per second
+
+  const CREEP         = 0.26;  // fraction of full speed while sizing up the field
+  const PANIC_RANGE   = 170;   // a wolf this close and you run, whatever your plan was
+  const AVOID         = 190;   // how far out a running deer starts cutting away
+  const AVOID_PUSH    = 170;   // how hard it cuts
+
+  // Layer 2: the plan each animal commits to before the whistle.
+  const DEER_PLANS    = [['now',.30],['follow',.30],['wait',.25],['wide',.15]];
+  const WOLF_PLANS    = [['charge',.40],['hold',.35],['lurk',.25]];
+  const HERD_TRIGGER  = 0.30;  // how much of the herd must be running to pull a follower
+  const WAIT_FRAC     = 0.35;  // how far into the round a waiting deer finally goes
+  const WOLF_WIDE     = 0.30;  // share of wolves covering the field instead of massing
+  const ENGAGE_HOLD   = 155;   // how close a deer gets before a line-holder breaks
+  const ENGAGE_LURK   = 215;
+
+  const DISPLAY = '"Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif';
+
+  let agents = [];
+  let round = 1;
+  let elapsed = 0;
+  let running = false;
+  let awaitingStart = true;
+  let pointerActive = false;
+  let target = {x: margin+10, y:H/2};
+  let direction = 1; // 1 left->right, -1 right->left
+  let lastTime = performance.now();
+  let roundEnding = false;
+  let history = [];
+  let autoTimer = null;
+  let clock = 0;               // drives the running bob
+  let puffs = [];              // dust kicked up by a tag
+  let autoStart = false;
+  let statusText = '';
+  let countdown = 0;                // 3-2-1 before the round opens
+  let lastCount = 0;
+  let tally = {deer:0, wolves:0};   // what the scoreboard and bars are showing
+  let tallyAnim = null;             // counts step to their new values, not jump
+  const TALLY_DUR = 1.0;
+  let hotspots = [];           // canvas buttons, rebuilt every frame
+  const keys = new Set();
+
+  function rand(a,b){ return a + Math.random()*(b-a); }
+  function clamp(v,a,b){ return Math.max(a,Math.min(b,v)); }
+  function dist(a,b){ return Math.hypot(a.x-b.x,a.y-b.y); }
+
+  /* ---------- sound ----------------------------------------------------
+     Synthesised in the browser, no files. The idiom is impressionist: a
+     D-flat pentatonic set, soft attacks, long decays, everything fed into a
+     procedurally generated reverb. Because every pitch comes from the same
+     five-note set, nothing the game plays can sound wrong against anything
+     else — the tally stepping becomes an arpeggio rather than a rattle.
+  --------------------------------------------------------------------- */
+
+  let audio=null, master=null, reverb=null, muted=false, ambTimer=null, droneTimer=null;
+  const SCALE=[61,63,66,68,70];               // D♭ E♭ G♭ A♭ B♭
+  const mtof = m => 440*Math.pow(2,(m-69)/12);
+  const scaleNote = i => SCALE[((i%5)+5)%5] + 12*Math.floor(i/5);
+
+  function initAudio(){
+    // Also the "keep it running" path: a context can come back suspended, and
+    // only a user gesture is allowed to resume it.
+    if(audio){ if(audio.state==='suspended') audio.resume(); return; }
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if(!AC) return;
+    try{ audio = new AC(); }catch{ return; }
+
+    master = audio.createGain();
+    master.gain.value = muted ? 0 : 0.9;
+    master.connect(audio.destination);
+
+    // a noise burst with an exponential tail makes a serviceable hall
+    const len = Math.floor(audio.sampleRate*2.8);
+    const buf = audio.createBuffer(2, len, audio.sampleRate);
+    for(let ch=0;ch<2;ch++){
+      const d = buf.getChannelData(ch);
+      for(let i=0;i<len;i++) d[i] = (Math.random()*2-1)*Math.pow(1-i/len, 2.8);
+    }
+    reverb = audio.createConvolver();
+    reverb.buffer = buf;
+    const wet = audio.createGain();
+    wet.gain.value = 0.5;
+    reverb.connect(wet); wet.connect(master);
+
+    startWind();
+    startAmbience();
+  }
+
+  function note(m, {dur=2.4, level=0.15, type='sine', when=0, detune=5}={}){
+    if(!audio) return;
+    const t = audio.currentTime + when;
+    const g = audio.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(level, t+0.04);
+    g.gain.exponentialRampToValueAtTime(0.0001, t+dur);
+    g.connect(master);
+    if(reverb) g.connect(reverb);
+    for(const d of [-detune, detune]){
+      const o = audio.createOscillator();
+      o.type=type;
+      o.frequency.value=mtof(m);
+      o.detune.value=d;
+      o.connect(g);
+      o.start(t); o.stop(t+dur+0.06);
+    }
+  }
+
+  function startWind(){
+    const len = Math.floor(audio.sampleRate*4);
+    const nb = audio.createBuffer(1, len, audio.sampleRate);
+    const nd = nb.getChannelData(0);
+    for(let i=0;i<len;i++) nd[i]=Math.random()*2-1;
+    const src = audio.createBufferSource();
+    src.buffer=nb; src.loop=true;
+    const lp = audio.createBiquadFilter();
+    lp.type='lowpass'; lp.frequency.value=400; lp.Q.value=0.6;
+    const g = audio.createGain(); g.gain.value=0.022;
+    const lfo = audio.createOscillator(); lfo.frequency.value=0.05;
+    const lfoG = audio.createGain(); lfoG.gain.value=190;
+    lfo.connect(lfoG); lfoG.connect(lp.frequency);
+    src.connect(lp); lp.connect(g); g.connect(master);
+    src.start(); lfo.start();
+  }
+
+  // Sparse single notes over a slow low drone. Nothing repeats on a bar line,
+  // so it reads as weather rather than as a loop.
+  function startAmbience(){
+    const voice = () => {
+      if(audio && !muted && !document.hidden){
+        if(Math.random()<0.6) note(scaleNote(7+Math.floor(Math.random()*6)), {dur:3.6, level:0.05});
+        if(Math.random()<0.3) note(scaleNote(3+Math.floor(Math.random()*5)), {dur:4.6, level:0.04, type:'triangle', when:0.7});
+      }
+      if(audio) ambTimer = setTimeout(voice, 2200+Math.random()*3200);
+    };
+    const drone = () => {
+      if(audio && !muted && !document.hidden){
+        note(scaleNote(-5), {dur:9, level:0.05, type:'triangle', detune:3});
+        note(scaleNote(-3), {dur:9, level:0.035, type:'sine', detune:3});
+      }
+      if(audio) droneTimer = setTimeout(drone, 8000+Math.random()*3000);
+    };
+    voice(); drone();
+  }
+
+  function setMuted(m){
+    muted = m;
+    if(master) master.gain.linearRampToValueAtTime(muted?0:0.9, audio.currentTime+0.15);
+  }
+
+  // Audio outlives the picture unless it is explicitly torn down: a hidden page
+  // keeps its context running, and the ambience would go on scheduling notes.
+  function teardownAudio(){
+    if(ambTimer){ clearTimeout(ambTimer); ambTimer=null; }
+    if(droneTimer){ clearTimeout(droneTimer); droneTimer=null; }
+    if(audio){ try{ audio.close(); }catch{} }
+    audio=null; master=null; reverb=null;
+  }
+
+  document.addEventListener('visibilitychange', ()=>{
+    if(!audio) return;
+    if(document.hidden) audio.suspend();
+    else if(!muted) audio.resume();
+  });
+  window.addEventListener('pagehide', teardownAudio);
+  window.addEventListener('beforeunload', teardownAudio);
+
+  const sfx = {
+    start(){ note(scaleNote(2),{dur:1.6,level:0.10}); note(scaleNote(5),{dur:2.2,level:0.09,when:0.12}); },
+    tag(){   note(scaleNote(-2),{dur:0.7,level:0.13,type:'triangle'}); },
+    safe(){  note(scaleNote(12),{dur:1.4,level:0.09}); },
+    // pitch follows the population, so a rise sounds like a rise
+    step(count){ note(scaleNote(2+Math.round(count/totalAgents*12)), {dur:1.1, level:0.085}); },
+    roundEnd(){ [0,2,4].forEach((d,i)=>note(scaleNote(4+d),{dur:3.2,level:0.06,when:i*0.09})); },
+    overshoot(){ note(scaleNote(-7),{dur:5,level:0.11,type:'triangle',detune:3}); }
+  };
+
+  /* ---------- static scenery, generated once so it never flickers ---------- */
+
+  const grass = [];
+  for(let i=0;i<220;i++){
+    grass.push({
+      x: rand(margin, W-margin),
+      y: rand(fieldTop+6, H-6),
+      h: rand(3,7),
+      lean: rand(-2,2),
+      shade: ['#b6c391','#aebb87','#c2cd9f'][Math.floor(Math.random()*3)]
+    });
+  }
+  const canopy = [];
+  for(const side of [0,1]){
+    const cx = side===0 ? margin*0.5 : W-margin*0.5;
+    for(let i=0;i<16;i++){
+      canopy.push({
+        x: cx + rand(-margin*0.55, margin*0.55),
+        y: rand(fieldTop-8, H+8),
+        r: rand(15,27),
+        shade: ['#4a5c3c','#3f5033','#566a45'][Math.floor(Math.random()*3)]
+      });
+    }
+  }
+  const hedge = [];
+  for(let i=0;i<70;i++){
+    hedge.push({x: rand(-10,W+10), y: rand(-6,6), r: rand(10,20),
+                shade: ['#4a5c3c','#3f5033'][Math.floor(Math.random()*2)]});
+  }
+
+  /* ---------- animal silhouettes ---------- */
+
+  // Both are drawn facing +x in a space where the feet rest on y = 0.
+  // A leg that tapers toward the hoof reads as an animal; a rectangle does not.
+  function leg(c,x,top,wTop,wBot){
+    c.beginPath();
+    c.moveTo(x-wTop/2, top);
+    c.lineTo(x+wTop/2, top);
+    c.lineTo(x+wBot/2, 0);
+    c.lineTo(x-wBot/2, 0);
+    c.closePath();
+    c.fill();
+  }
+
+  // A deer is about as tall as it is long: long legs, a shallow body, a thin
+  // neck. Getting those three ratios right is most of the silhouette.
+  function deerPath(c){
+    leg(c, 5.0, -13.6, 2.3, 1.2);
+    leg(c,-8.5, -13.8, 2.5, 1.2);
+    c.globalAlpha*=0.8;                        // far side legs sit in shade
+    leg(c, 7.6, -13.6, 2.0, 1.1);
+    leg(c,-11.0,-13.8, 2.2, 1.1);
+    c.globalAlpha/=0.8;
+
+    c.beginPath();
+    c.moveTo(-11,-17.2);
+    c.bezierCurveTo(-6,-18.6, -1,-18.6, 3,-17.6);     // back
+    c.bezierCurveTo(5.4,-20, 7,-23, 9,-25.6);          // neck, thin and rising
+    c.bezierCurveTo(10,-27, 12.4,-27.6, 14,-27);       // skull
+    c.lineTo(17.4,-26);                                 // bridge of the nose
+    c.bezierCurveTo(18.9,-25.6, 18.8,-23.9, 17.2,-23.7);
+    c.lineTo(14,-23.5);                                 // muzzle, then jaw
+    c.bezierCurveTo(12,-22.7, 10.6,-20, 8.6,-17);
+    c.bezierCurveTo(7.6,-15.6, 6.6,-14.7, 5,-14.3);     // chest
+    c.bezierCurveTo(0,-13.5, -5,-13.7, -8,-14.1);       // belly
+    c.bezierCurveTo(-10,-14.5, -11,-15.6, -11,-17.2);
+    c.closePath();
+    c.fill();
+
+    c.beginPath();                                      // ear
+    c.moveTo(10.6,-26.2); c.lineTo(8.4,-29.4); c.lineTo(12,-28);
+    c.closePath(); c.fill();
+
+    c.beginPath();                                      // tail
+    c.moveTo(-10.6,-17.6); c.lineTo(-13.4,-20.4); c.lineTo(-10.2,-15.2);
+    c.closePath(); c.fill();
+  }
+
+  function deerAntlers(c){
+    c.lineWidth=1.2;
+    c.lineCap='round';
+    c.lineJoin='round';
+    c.beginPath();
+    c.moveTo(12.4,-27.2);                               // near beam
+    c.bezierCurveTo(11.8,-30.4, 10.4,-32.4, 8.2,-33.6);
+    c.moveTo(11.9,-29.6); c.lineTo(9.2,-30.6);
+    c.moveTo(11.2,-31.4); c.lineTo(9.6,-33);
+    c.moveTo(14,-27.2);                                 // far beam
+    c.bezierCurveTo(14.2,-30.4, 13.8,-32.4, 12.4,-34);
+    c.moveTo(14.1,-30); c.lineTo(16.2,-31.4);
+    c.stroke();
+  }
+
+  // A wolf is long and low: level back, head carried out front rather than up,
+  // and a brush tail that reads as a separate mass from the body.
+  function wolfPath(c){
+    leg(c, 6.0, -10.4, 2.3, 1.4);
+    leg(c,-9.0, -12.8, 2.5, 1.4);   // hind legs tuck up under the drawn-in belly
+    c.globalAlpha*=0.8;
+    leg(c, 8.6, -10.4, 2.0, 1.3);
+    leg(c,-11.5,-13.0, 2.2, 1.3);
+    c.globalAlpha/=0.8;
+
+    // The tail starts well inside the body so it reads as growing out of the
+    // rump rather than floating alongside it.
+    c.beginPath();
+    c.moveTo(-8,-15.6);
+    c.bezierCurveTo(-13,-17.8, -18.4,-17.6, -20.8,-14.8);
+    c.bezierCurveTo(-17.8,-13.4, -12.4,-12.6, -8,-12.4);
+    c.closePath(); c.fill();
+
+    c.beginPath();
+    c.moveTo(-11.6,-15.2);
+    c.bezierCurveTo(-7,-16.8, -1,-16.6, 4,-16);         // level back
+    c.bezierCurveTo(6.8,-16.1, 8.6,-15.8, 10.2,-15.2);  // shoulder into neck
+    c.bezierCurveTo(11.4,-16.2, 13,-16.1, 14.2,-15.2);  // skull, with a brow
+    c.bezierCurveTo(15.4,-14.6, 16.6,-14.2, 18,-13.9);
+    c.lineTo(20,-13.5);                                  // muzzle, carried low
+    c.bezierCurveTo(21.2,-13.2, 21,-11.8, 19.4,-11.7);
+    c.lineTo(15.6,-11.8);
+    c.bezierCurveTo(13.6,-11.9, 12.2,-11.6, 10.6,-11.3);// throat
+    c.bezierCurveTo(8.6,-11, 7,-10.8, 5.6,-10.6);       // deep chest
+    c.bezierCurveTo(1,-10.4, -3,-10.9, -6,-11.9);       // belly, tucked at the rear
+    c.bezierCurveTo(-8.4,-12.7, -10.6,-13.4, -11.6,-15.2);
+    c.closePath();
+    c.fill();
+
+    c.beginPath();                                      // pricked ears
+    c.moveTo(11,-15.4); c.lineTo(10.2,-19.4); c.lineTo(13.4,-16.2);
+    c.closePath(); c.fill();
+    c.beginPath();
+    c.moveTo(13.6,-15.2); c.lineTo(14,-18.6); c.lineTo(16.2,-15.3);
+    c.closePath(); c.fill();
+  }
+
+  function startPositions(type, idx, count) {
+    // Just clear of the treeline: a brown deer on dark woods is hard to read.
+    const x = direction===1 ? margin+16 : W-margin-16;
+    const spacing = (yMax-yMin)/(Math.max(1,count));
+    const y = yMin + spacing*(idx+0.5) + rand(-8,8);
+    return {x:x+rand(-8,8), y:clamp(y, yMin, yMax)};
+  }
+
+  function setupGame() {
+    if(autoTimer){ clearTimeout(autoTimer); autoTimer=null; }
+    agents = [];
+    direction = 1;
+    round = 1;
+    elapsed = 0;
+    running = false;
+    awaitingStart = true;
+    roundEnding = false;
+    puffs = [];
+    keys.clear();
+
+    // the ladder, evenly spread; you take the second rung so exactly one animal
+    // on the field is faster than you
+    const ladder = [];
+    for(let i=0;i<totalAgents;i++){
+      ladder.push(SPEED_FLOOR + (SPEED_TOP-SPEED_FLOOR)*i/(totalAgents-1));
+    }
+    const fastest = ladder.pop();
+    const second  = ladder.pop();
+    for(let i=ladder.length-1;i>0;i--){         // shuffle, so speed is unrelated to position
+      const j=Math.floor(Math.random()*(i+1));
+      [ladder[i],ladder[j]]=[ladder[j],ladder[i]];
+    }
+    const playerId = startingWolves;            // the player starts as the first deer
+    let flier = playerId;
+    while(flier===playerId) flier = Math.floor(Math.random()*totalAgents);
+
+    let k=0;
+    for(let i=0;i<totalAgents;i++){
+      agents.push({
+        id:i,
+        type: i<startingWolves ? 'wolf' : 'deer',
+        player: i===playerId,
+        speed: i===playerId ? second : i===flier ? fastest : ladder[k++],
+        heading: 0,
+        x:0,y:0,vx:0,vy:0,
+        face:1,
+        caught:false,
+        caughtBy:null,
+        catches:0,
+        crossed:false,
+        pop:0
+      });
+    }
+    history = [];
+    positionForRound();
+    saveHistory();
+    settleTally();
+    updateHud();
+    statusText = '';
+  }
+
+  function pick(table){
+    let r=Math.random();
+    for(const [name,share] of table){ r-=share; if(r<=0) return name; }
+    return table[table.length-1][0];
+  }
+
+  // Both lines: deer on the side they are leaving, wolves on the side the deer
+  // are trying to reach. The deer have to get through them.
+  function deerLineX(){ return direction===1 ? margin+16 : W-margin-16; }
+  function wolfLineX(){ return direction===1 ? W-margin-26 : margin+26; }
+
+  function positionForRound(){
+    const deer = agents.filter(a=>a.type==='deer');
+    const wolves = agents.filter(a=>a.type==='wolf');
+
+    deer.forEach((a,i)=>{
+      const spacing=(yMax-yMin)/Math.max(1,deer.length);
+      a.x = deerLineX() + rand(-8,8);
+      a.y = clamp(yMin + spacing*(i+0.5) + rand(-8,8), yMin, yMax);
+      a.vx=a.vy=0;
+      a.heading = direction===1 ? 0 : Math.PI;
+      a.face = direction;
+      a.caught=false; a.caughtBy=null; a.crossed=false; a.catches=0; a.pop=0;
+      a.state='watch';
+      a.plan = pick(DEER_PLANS);
+      a.lane = a.y;
+    });
+
+    wolves.forEach((a,i)=>{
+      a.x = wolfLineX() + rand(-10,10);
+      a.y = clamp(yMin + (yMax-yMin)*(i+0.5)/wolves.length + rand(-12,12), yMin, yMax);
+      a.vx=a.vy=0; a.catches=0; a.crossed=false; a.caught=false; a.pop=0;
+      a.heading = direction===1 ? Math.PI : 0;
+      a.face = -direction;
+      a.target=null;
+      a.engaged=false;
+      a.plan = pick(WOLF_PLANS);
+      // Layer 1: most wolves line up on a deer; the rest spread out to cover
+      // the field. With one deer left they all pile in front of it; with
+      // eighteen they fan out, and neither case had to be special-cased.
+      if(Math.random()<WOLF_WIDE || !deer.length){
+        a.cdLane = yMin + (yMax-yMin)*(i+0.5)/wolves.length;
+      } else {
+        a.cdLane = clamp(deer[Math.floor(Math.random()*deer.length)].y + rand(-28,28), yMin, yMax);
+      }
+    });
+
+    const player = agents.find(a=>a.player);
+    if(player) target={x:player.x,y:player.y};
+  }
+
+  function saveHistory(){
+    history.push({
+      round,
+      deer: agents.filter(a=>a.type==='deer').length,
+      wolves: agents.filter(a=>a.type==='wolf').length
+    });
+  }
+
+  function updateHud(){ /* the scoreboard is drawn every frame; nothing to sync */ }
+
+  function isFirstRound(){ return round===1 && history.length<=1; }
+
+  function deerCount(){ return agents.filter(a=>a.type==='deer').length; }
+  function wolfCount(){ return agents.filter(a=>a.type==='wolf').length; }
+
+  function settleTally(){
+    tally.deer = deerCount();
+    tally.wolves = wolfCount();
+    tallyAnim = null;
+  }
+
+  // One animal per step, with the steps spread evenly across TALLY_DUR, so a
+  // big swing rattles through and a change of one ticks once.
+  function stepTo(from,to,p){
+    const n = Math.abs(to-from);
+    if(n===0) return to;
+    return from + Math.sign(to-from)*Math.min(n, Math.floor(p*n + 1e-6));
+  }
+
+  function pointerPos(e){
+    const r=canvas.getBoundingClientRect();
+    return {
+      x:(e.clientX-r.left)*W/r.width,
+      y:(e.clientY-r.top)*H/r.height
+    };
+  }
+
+  function hit(r,p){ return p.x>=r.x && p.x<=r.x+r.w && p.y>=r.y && p.y<=r.y+r.h; }
+
+  // A thumb covers whatever it touches, so on a touchscreen the animal runs a
+  // little above the contact point. A mouse pointer hides nothing, so it doesn't.
+  const TOUCH_OFFSET = 55;
+  function steerTarget(e){
+    const p = pointerPos(e);
+    if(e.pointerType==='touch' || e.pointerType==='pen') p.y -= TOUCH_OFFSET;
+    return p;
+  }
+
+  canvas.addEventListener('pointerdown', e=>{
+    initAudio();                                // audio needs a user gesture
+    const p = pointerPos(e);
+    for(const s of hotspots){
+      if(hit(s,p)){ s.act(); return; }          // a button swallows the click
+    }
+    if(p.y < fieldTop) return;                  // never steer from the scoreboard
+    pointerActive=true;
+    canvas.setPointerCapture(e.pointerId);
+    target=steerTarget(e);
+  });
+  canvas.addEventListener('pointermove', e=>{
+    if(pointerActive) target=steerTarget(e);
+  });
+  canvas.addEventListener('pointerup', e=>{
+    pointerActive=false;
+    try{canvas.releasePointerCapture(e.pointerId)}catch{}
+  });
+  canvas.addEventListener('pointercancel', ()=>pointerActive=false);
+
+  function togglePause(){
+    if(awaitingStart) return;
+    running=!running;
+    statusText = running ? '' : 'Paused';
+  }
+
+  const moveKeys = new Set(['arrowup','arrowdown','arrowleft','arrowright','w','a','s','d']);
+  window.addEventListener('keydown', e=>{
+    const k = e.key.toLowerCase();
+    if(moveKeys.has(k)){ keys.add(k); e.preventDefault(); return; }
+    if(k===' '||k==='enter'){ e.preventDefault(); initAudio(); if(awaitingStart) beginRound(); else togglePause(); return; }
+    if(k==='p'){ e.preventDefault(); togglePause(); return; }
+    if(k==='r'){ e.preventDefault(); setupGame(); return; }
+    if(k==='m'){ e.preventDefault(); initAudio(); setMuted(!muted); return; }
+  });
+  window.addEventListener('keyup', e=>{ keys.delete(e.key.toLowerCase()); });
+  window.addEventListener('blur', ()=>keys.clear());
+
+  function beginRound(){
+    if(autoTimer){ clearTimeout(autoTimer); autoTimer=null; }
+    positionForRound();
+    settleTally();               // starting early snaps the count to its total
+    elapsed = 0;
+    countdown = COUNTDOWN;
+    lastCount = Math.ceil(COUNTDOWN);
+    awaitingStart = false;
+    roundEnding = false;
+    running = true;
+    statusText = '';
+    updateHud();
+  }
+
+  // Everything on the field moves through this, so everything turns at the same
+  // rate. Running flat out at a target that cuts sideways means sailing past it.
+  function moveToward(a,tx,ty,speed,dt){
+    const dx=tx-a.x, dy=ty-a.y;
+    const d=Math.hypot(dx,dy);
+    if(d<0.01) return;
+
+    let diff = Math.atan2(dy,dx) - a.heading;
+    while(diff>Math.PI) diff-=2*Math.PI;
+    while(diff<-Math.PI) diff+=2*Math.PI;
+    a.heading += clamp(diff, -TURN*dt, TURN*dt);
+
+    const sp = speed*Math.min(1, d/12);      // ease off on arrival, so nothing orbits
+    a.vx = Math.cos(a.heading)*sp;
+    a.vy = Math.sin(a.heading)*sp;
+    a.x = clamp(a.x + a.vx*dt, 4, W-4);
+    a.y = clamp(a.y + a.vy*dt, yMin, yMax);
+    if(Math.abs(a.vx)>6) a.face = a.vx>0 ? 1 : -1;
+  }
+
+  function movePlayer(a,dt){
+    let kx=0, ky=0;
+    if(keys.has('arrowleft')||keys.has('a')) kx-=1;
+    if(keys.has('arrowright')||keys.has('d')) kx+=1;
+    if(keys.has('arrowup')||keys.has('w')) ky-=1;
+    if(keys.has('arrowdown')||keys.has('s')) ky+=1;
+
+    if(kx||ky){
+      const m=Math.hypot(kx,ky);
+      target = {x: clamp(a.x + (kx/m)*120, margin, W-margin),
+                y: clamp(a.y + (ky/m)*120, yMin, yMax)};
+    }
+    moveToward(a, clamp(target.x, margin, W-margin), clamp(target.y, yMin, yMax), a.speed, dt);
+  }
+
+  function tag(wolf, prey){
+    prey.caught=true;
+    prey.caughtBy=wolf.id;
+    wolf.catches=1;
+    prey.vx=prey.vy=0;
+    prey.pop=1;
+    puffs.push({x:prey.x, y:prey.y, t:0});
+    sfx.tag();
+  }
+
+  function update(dt){
+    clock += dt;
+
+    if(tallyAnim){
+      tallyAnim.t += dt;
+      const p = clamp(tallyAnim.t/TALLY_DUR, 0, 1);
+      const was = tally.deer;
+      tally.deer   = stepTo(tallyAnim.fromD, tallyAnim.toD, p);
+      tally.wolves = stepTo(tallyAnim.fromW, tallyAnim.toW, p);
+      if(tally.deer!==was) sfx.step(tally.deer);   // one note per animal moved
+      if(p>=1){
+        tallyAnim = null;
+        if(tally.deer<=2 || tally.wolves<=2) sfx.overshoot();
+      }
+    }
+
+    for(const p of puffs) p.t += dt;
+    puffs = puffs.filter(p=>p.t<0.6);
+    for(const a of agents) if(a.pop>0) a.pop = Math.max(0, a.pop - dt*3);
+
+    if(!running || roundEnding || awaitingStart) return;
+
+    // Nobody moves until the count reaches zero — this is where you find yourself.
+    if(countdown>0){
+      countdown -= dt;
+      const n = Math.ceil(Math.max(0,countdown));
+      if(n!==lastCount){
+        lastCount = n;
+        if(n>0) note(scaleNote(4), {dur:0.5, level:0.09});
+        else sfx.start();
+      }
+      // Layer 1 in motion. Wolves slide to the lane they picked; deer read the
+      // wolf line as it forms and slide toward whatever part of it is thinnest.
+      for(const a of agents){
+        if(a.player) continue;
+        if(a.type==='wolf'){
+          const dy = a.cdLane - a.y;
+          if(Math.abs(dy)>1) a.y += Math.sign(dy)*Math.min(Math.abs(dy), a.speed*0.30*dt);
+        }else{
+          let rep=0;
+          for(const w of agents){
+            if(w.type!=='wolf') continue;
+            const d=a.y-w.y, ad=Math.abs(d);
+            if(ad<260) rep += (d>=0?1:-1)*(1-ad/260);
+          }
+          a.y = clamp(a.y + clamp(rep,-1,1)*a.speed*0.34*dt, yMin, yMax);
+        }
+      }
+      return;
+    }
+
+    elapsed += dt;
+
+    const deer = agents.filter(a=>a.type==='deer' && !a.caught && !a.crossed);
+    const wolves = agents.filter(a=>a.type==='wolf');
+
+    const wild = deer.filter(a=>!a.player);
+    const runners = wild.filter(a=>a.state==='run');
+    const runningFrac = wild.length ? runners.length/wild.length : 0;
+    const herdY = runners.length
+      ? runners.reduce((s,a)=>s+a.y,0)/runners.length
+      : (yMin+yMax)/2;
+    const wolfY = wolves.length
+      ? wolves.reduce((s,a)=>s+a.y,0)/wolves.length
+      : (yMin+yMax)/2;
+
+    for(const a of deer){
+      if(a.player){
+        movePlayer(a,dt);
+      }else{
+        const goalX = direction===1 ? W-margin : margin;
+        let nearest=null, nd=Infinity;
+        for(const w of wolves){
+          const d=dist(a,w);
+          if(d<nd){nd=d;nearest=w;}
+        }
+
+        if(a.state==='watch'){
+          a.waited += dt;
+          // Layer 2: the plan you committed to, unless a wolf is already on you
+          const go = nd<PANIC_RANGE
+                  || a.plan==='now' || a.plan==='wide'
+                  || (a.plan==='follow' && runningFrac>=HERD_TRIGGER)
+                  || (a.plan==='wait'   && elapsed>=roundDuration*WAIT_FRAC);
+          if(go){
+            a.state='run';
+            a.lane = a.plan==='wide'
+              ? (a.y < (yMin+yMax)/2 ? yMin+rand(6,40) : yMax-rand(6,40))
+              : clamp(a.y + (wolfY<a.y ? rand(0,50) : rand(-50,0)), yMin, yMax);
+          }else{
+            // the slow watching crawl: edge forward, head turning
+            const look = a.y + Math.sin(clock*1.5 + a.id)*16;
+            moveToward(a, goalX, clamp(look,yMin,yMax), a.speed*CREEP, dt);
+          }
+        }
+
+        if(a.state==='run'){
+          // Steer around wolves rather than running into them. Reacting only at
+          // close range meant every wolf intercepted and no chase ever failed.
+          let rep = 0;
+          for(const w of wolves){
+            if(w.catches>=1) continue;
+            const d = dist(a,w);
+            if(d < AVOID){
+              const near = 1 - d/AVOID;
+              rep += (a.y>=w.y ? 1 : -1) * near*near * AVOID_PUSH;
+            }
+          }
+          const gy = rep ? a.y + rep : a.lane;
+          moveToward(a,goalX,clamp(gy,yMin,yMax),a.speed,dt);
+        }
+      }
+
+      if((direction===1 && a.x>=W-margin-2) || (direction===-1 && a.x<=margin+2)){
+        a.crossed=true;
+        if(a.player) sfx.safe();   // only for your own deer, or it is a chorus
+      }
+    }
+
+    for(const w of wolves){
+      if(w.catches>=1) continue; // one catch max per round, player included
+
+      if(w.player){
+        movePlayer(w,dt);
+        let prey=null, nd=Infinity;
+        for(const d of deer){
+          if(d.caught || d.crossed) continue;
+          const dd=dist(w,d);
+          if(dd<nd){nd=dd;prey=d;}
+        }
+        if(prey && nd<tagDistance){
+          tag(w,prey);
+          statusText='You made your catch — your hunt is over for this round.';
+        }
+        continue;
+      }
+
+      // Layer 3. A wolf commits to one deer and races the other wolves for it.
+      // Nothing divides the deer up between them: several wolves breaking for
+      // the same animal is exactly why so many go hungry.
+      let targetDeer = w.target==null ? null : agents.find(a=>a.id===w.target);
+      if(targetDeer && (targetDeer.type!=='deer' || targetDeer.caught || targetDeer.crossed)){
+        targetDeer = null;                       // somebody beat you to it
+        w.target = null;
+      }
+      if(!targetDeer){
+        let best=Infinity;
+        for(const d of deer){
+          if(d.caught || d.crossed) continue;
+          const dd=dist(w,d);
+          if(dd<best){ best=dd; targetDeer=d; }
+        }
+        w.target = targetDeer ? targetDeer.id : null;
+      }
+
+      const near = targetDeer ? dist(w,targetDeer) : Infinity;
+
+      // Layer 2 for the predators: hold the line, hang back, or go straight at them
+      if(!w.engaged){
+        if(w.plan==='hold'){
+          if(near<ENGAGE_HOLD) w.engaged=true;
+          else {
+            moveToward(w, wolfLineX(), targetDeer?targetDeer.y:w.y, w.speed*0.85, dt);
+            continue;
+          }
+        } else if(w.plan==='lurk'){
+          if(near<ENGAGE_LURK) w.engaged=true;
+          else {
+            const lurkX = wolfLineX() + (deerLineX()-wolfLineX())*0.32;
+            moveToward(w, lurkX, targetDeer?targetDeer.y:w.y, w.speed*0.55, dt);
+            continue;
+          }
+        } else {
+          w.engaged = true;                      // chargers go at the whistle
+        }
+      }
+
+      if(targetDeer){
+        moveToward(w,targetDeer.x,targetDeer.y,w.speed,dt);
+        if(dist(w,targetDeer)<tagDistance) tag(w,targetDeer);
+      }
+    }
+
+    const activeDeer = agents.filter(a=>a.type==='deer' && !a.caught && !a.crossed);
+    if(elapsed>=roundDuration || activeDeer.length===0){
+      endRound();
+    }
+  }
+
+  function endRound(){
+    roundEnding=true;
+    running=false;
+
+    const player = agents.find(a=>a.player);
+    const wasPlayerDeer = player && player.type==='deer';
+    const playerCaught = wasPlayerDeer && player.caught;
+    const playerFedWolf = player && player.type==='wolf' && player.catches>0;
+
+    const prevDeer = deerCount(), prevWolves = wolfCount();
+
+    const toWolf = new Set(agents.filter(a=>a.type==='deer' && a.caught).map(a=>a.id));
+    const toDeer = new Set(agents.filter(a=>a.type==='wolf' && a.catches===0).map(a=>a.id));
+
+    // A population with no predators can never recover: one hungry wolf hangs on.
+    if(toWolf.size===0 && toDeer.size===agents.filter(a=>a.type==='wolf').length && toDeer.size>0){
+      const survivors=[...toDeer];
+      toDeer.delete(survivors[Math.floor(Math.random()*survivors.length)]);
+    }
+
+    for(const a of agents){
+      if(toWolf.has(a.id)) a.type='wolf';
+      else if(toDeer.has(a.id)) a.type='deer';
+    }
+
+    round++;
+    direction *= -1;
+    elapsed=0;
+    saveHistory();
+    tally.deer = prevDeer;
+    tally.wolves = prevWolves;
+    tallyAnim = {fromD:prevDeer, toD:deerCount(), fromW:prevWolves, toW:wolfCount(), t:0};
+    sfx.roundEnd();
+    awaitingStart=true;
+    updateHud();
+
+    if(playerCaught){
+      statusText='You were tagged — you hunt as a wolf next round.';
+    }else if(wasPlayerDeer){
+      statusText='You survived — you stay a deer.';
+    }else if(playerFedWolf){
+      statusText='You ate — you stay a wolf.';
+    }else{
+      statusText='You caught nothing — you are a deer next round.';
+    }
+
+    if(autoStart){
+      autoTimer=setTimeout(()=>{ autoTimer=null; beginRound(); }, autoStartDelay);
+    }
+  }
+
+  /* ---------- drawing ---------- */
+
+  function drawField(){
+    const g=ctx.createLinearGradient(0,fieldTop,0,H);
+    g.addColorStop(0,'#d5ddb8');
+    g.addColorStop(1,'#c0cb9b');
+    ctx.fillStyle=g;
+    ctx.fillRect(0,fieldTop,W,H-fieldTop);
+
+    ctx.lineCap='round';
+    ctx.lineWidth=1.4;
+    for(const t of grass){
+      ctx.strokeStyle=t.shade;
+      ctx.beginPath();
+      ctx.moveTo(t.x,t.y);
+      ctx.lineTo(t.x+t.lean,t.y-t.h);
+      ctx.stroke();
+    }
+
+    // hedgerows along the top and bottom of the field
+    for(const h of hedge){
+      ctx.fillStyle=h.shade;
+      ctx.beginPath(); ctx.arc(h.x,fieldTop+h.y,h.r,0,Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.arc(h.x,H-h.y,h.r,0,Math.PI*2); ctx.fill();
+    }
+
+    // the safe zones are woods
+    ctx.fillStyle='#435436';
+    ctx.fillRect(0,fieldTop,margin,H-fieldTop);
+    ctx.fillRect(W-margin,fieldTop,margin,H-fieldTop);
+    for(const c of canopy){
+      ctx.fillStyle=c.shade;
+      ctx.beginPath(); ctx.arc(c.x,c.y,c.r,0,Math.PI*2); ctx.fill();
+    }
+
+    // treeline edge catching the light
+    ctx.strokeStyle='rgba(245,240,220,.30)';
+    ctx.lineWidth=2;
+    ctx.setLineDash([10,9]);
+    ctx.beginPath(); ctx.moveTo(margin,fieldTop); ctx.lineTo(margin,H); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(W-margin,fieldTop); ctx.lineTo(W-margin,H); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  /* ---------- the scoreboard: a broadcast strip across the top ---------- */
+
+  function caps(c,text,x,y,size,track){
+    c.font=`600 ${size}px system-ui`;
+    let cx=x;
+    for(const ch of text){ c.fillText(ch,cx,y); cx += c.measureText(ch).width + track; }
+    return cx-track;
+  }
+  function capsWidth(c,text,size,track){
+    c.font=`600 ${size}px system-ui`;
+    let w=0;
+    for(const ch of text) w += c.measureText(ch).width + track;
+    return w-track;
+  }
+
+  function button(x,y,w,h,on,act){
+    hotspots.push({x,y,w,h,act});
+    ctx.fillStyle = on ? '#c9a227' : 'rgba(255,255,255,.11)';
+    ctx.strokeStyle = on ? '#c9a227' : 'rgba(255,255,255,.22)';
+    ctx.lineWidth=1;
+    ctx.beginPath();
+    if(ctx.roundRect) ctx.roundRect(x,y,w,h,6); else ctx.rect(x,y,w,h);
+    ctx.fill(); ctx.stroke();
+    return on ? '#20241c' : 'rgba(247,242,228,.92)';
+  }
+
+  function drawScoreboard(){
+    ctx.fillStyle='#1b1f18';
+    ctx.fillRect(0,0,W,STRIP_H);
+    ctx.fillStyle='rgba(0,0,0,.35)';
+    ctx.fillRect(0,STRIP_H-3,W,3);
+
+    const contentR = W - CTRL_W;      // everything but the controls
+    ctx.textBaseline='alphabetic';
+
+    // round and clock only: the populations are on the bars at each end
+    ctx.textAlign='center';
+    const mid=contentR/2;
+    ctx.fillStyle='rgba(242,231,214,.92)';
+    ctx.font=`600 17px ${DISPLAY}`;
+    const showClock = running && !roundEnding && !awaitingStart && countdown<=0;
+    const remain=Math.max(0,roundDuration-elapsed);
+    ctx.fillText(`ROUND ${round}`, showClock ? mid-34 : mid, 23);
+    if(showClock){
+      ctx.fillStyle = remain<3 ? '#e2703a' : 'rgba(242,231,214,.62)';
+      ctx.fillText(remain.toFixed(1)+'s', mid+40, 23);
+    }
+
+    // controls
+    const cy=(STRIP_H-26)/2;
+    let cx=contentR+8;
+    ctx.textAlign='center';
+
+    let fg=button(cx,cy,28,26,false,togglePause);
+    ctx.fillStyle=fg;
+    if(running && !awaitingStart){
+      ctx.fillRect(cx+9,cy+7,3.5,12); ctx.fillRect(cx+15.5,cy+7,3.5,12);
+    }else{
+      ctx.beginPath(); ctx.moveTo(cx+10,cy+7); ctx.lineTo(cx+20,cy+13); ctx.lineTo(cx+10,cy+19);
+      ctx.closePath(); ctx.fill();
+    }
+
+    cx+=34;
+    fg=button(cx,cy,28,26,false,setupGame);
+    ctx.strokeStyle=fg; ctx.lineWidth=1.8;
+    ctx.beginPath(); ctx.arc(cx+14,cy+13,6.2,0.5,Math.PI*1.75); ctx.stroke();
+    ctx.fillStyle=fg;
+    ctx.beginPath(); ctx.moveTo(cx+17.5,cy+4.5); ctx.lineTo(cx+20.5,cy+9.5); ctx.lineTo(cx+14.5,cy+9.5);
+    ctx.closePath(); ctx.fill();
+
+    cx+=34;
+    fg=button(cx,cy,28,26,false,()=>{ initAudio(); setMuted(!muted); });
+    ctx.fillStyle=fg;
+    ctx.beginPath();                                   // speaker cone
+    ctx.moveTo(cx+9,cy+10); ctx.lineTo(cx+13,cy+10); ctx.lineTo(cx+17,cy+6);
+    ctx.lineTo(cx+17,cy+20); ctx.lineTo(cx+13,cy+16); ctx.lineTo(cx+9,cy+16);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle=fg; ctx.lineWidth=1.4;
+    if(muted){
+      ctx.beginPath(); ctx.moveTo(cx+19,cy+9); ctx.lineTo(cx+24,cy+17);
+      ctx.moveTo(cx+24,cy+9); ctx.lineTo(cx+19,cy+17); ctx.stroke();
+    }else{
+      ctx.beginPath(); ctx.arc(cx+17,cy+13,4.5,-0.9,0.9); ctx.stroke();
+      ctx.beginPath(); ctx.arc(cx+17,cy+13,7.5,-0.9,0.9); ctx.stroke();
+    }
+
+    cx+=34;
+    fg=button(cx,cy,50,26,autoStart,()=>{
+      autoStart=!autoStart;
+      if(!autoStart && autoTimer){ clearTimeout(autoTimer); autoTimer=null; }
+    });
+    ctx.fillStyle=fg;
+    caps(ctx,'AUTO',cx+8,cy+17,10,1.2);
+  }
+
+  /* ---------- the population bars, standing in the woods at each end ---------- */
+
+  // How many rounds have ended on each possible population value.
+  function histogram(key){
+    const counts = new Array(totalAgents+1).fill(0);
+    for(const h of history) counts[clamp(h[key],0,totalAgents)]++;
+    return {counts, max: Math.max(1, ...counts)};
+  }
+
+  function panel(x,y0,w,h){
+    ctx.fillStyle='#222a1d';
+    ctx.strokeStyle='rgba(255,255,255,.12)';
+    ctx.lineWidth=1;
+    ctx.beginPath();
+    if(ctx.roundRect) ctx.roundRect(x,y0,w,h,7); else ctx.rect(x,y0,w,h);
+    ctx.fill(); ctx.stroke();
+  }
+
+  function drawPens(){
+    // One band only. Two and three standard deviations span the whole 0-21
+    // range in a population that swings this widely, so they were ink with no
+    // signal in them.
+    const pens=[
+      {key:'deer',   label:'DEER',   cx: margin/2,
+       band:'#5a3e23', dot:'#f0b24a', curve:'240,178,74'},
+      {key:'wolves', label:'WOLVES', cx: W-margin/2,
+       band:'#343b46', dot:'#8fd6e0', curve:'143,214,224'}
+    ];
+
+    const PW=75, AXIS=14;
+    const top=fieldTop+46, bot=H-38, ph=bot-top;
+    const y=v=>bot-ph*(v/totalAgents);
+
+    for(const p of pens){
+      const s=stats(p.key);
+      s.cur = tally[p.key];          // steps to its new value with the count
+      const hist=histogram(p.key);
+      const L=p.cx-PW/2, plotL=L+AXIS, plotW=PW-AXIS-6;
+
+      panel(L, fieldTop+10, PW, H-fieldTop-20);
+
+      // the scale, so the dots read as values rather than decoration
+      ctx.font='700 7px system-ui';
+      ctx.textAlign='right';
+      ctx.strokeStyle='rgba(255,255,255,.22)';
+      ctx.lineWidth=1;
+      for(let v=0; v<=totalAgents; v+=5){
+        ctx.fillStyle='rgba(242,231,214,.5)';
+        ctx.fillText(String(v), plotL-4, y(v)+2.5);
+        ctx.beginPath();
+        ctx.moveTo(plotL-2, y(v)+0.5); ctx.lineTo(plotL+2, y(v)+0.5);
+        ctx.stroke();
+      }
+
+      if(s.n>=3 && s.sd>0.01){
+        const hi=clamp(s.mean+s.sd,0,totalAgents), lo=clamp(s.mean-s.sd,0,totalAgents);
+        ctx.fillStyle=p.band;
+        ctx.fillRect(plotL, y(hi), plotW, Math.max(1.5, y(lo)-y(hi)));
+      }
+
+      // the shape the observations imply, smoothed so it reads as a curve
+      if(s.n>=4){
+        const bw=1.4;
+        const pts=[];
+        let peak=0;
+        for(let v=0; v<=totalAgents; v+=0.25){
+          let d=0;
+          for(const h of history){ const t=v-h[p.key]; d+=Math.exp(-(t*t)/(2*bw*bw)); }
+          pts.push([v,d]);
+          if(d>peak) peak=d;
+        }
+        if(peak>0){
+          ctx.beginPath();
+          ctx.moveTo(plotL, y(0));
+          for(const [v,d] of pts) ctx.lineTo(plotL+plotW*d/peak, y(v));
+          ctx.lineTo(plotL, y(totalAgents));
+          ctx.closePath();
+          ctx.fillStyle=`rgba(${p.curve},.13)`;
+          ctx.fill();
+          ctx.beginPath();
+          pts.forEach(([v,d],i)=>{
+            const px=plotL+plotW*d/peak, py=y(v);
+            i ? ctx.lineTo(px,py) : ctx.moveTo(px,py);
+          });
+          ctx.strokeStyle=`rgba(${p.curve},.55)`;
+          ctx.lineWidth=1.2;
+          ctx.stroke();
+        }
+      }
+
+      // one dot per round that ended on this value, stacking outward
+      const pitch=Math.min(5.4, plotW/Math.max(1,hist.max));
+      const r=Math.min(2.1, pitch*0.44);
+      ctx.fillStyle=p.dot;
+      for(let v=0; v<=totalAgents; v++){
+        for(let i=0;i<hist.counts[v];i++){
+          ctx.beginPath();
+          ctx.arc(plotL+r+1+i*pitch, y(v), r, 0, Math.PI*2);
+          ctx.fill();
+        }
+      }
+
+      // the level the population oscillates around
+      if(s.n>=2){
+        ctx.strokeStyle='#f0cc7d';
+        ctx.lineWidth=2;
+        ctx.beginPath();
+        ctx.moveTo(plotL-4, y(s.mean)); ctx.lineTo(plotL+plotW+4, y(s.mean));
+        ctx.stroke();
+        ctx.textAlign='left';
+        ctx.fillStyle='#f0cc7d';
+        caps(ctx,'EQUILIBRIUM', plotL, y(s.mean)-5, 6, 0.9);
+      }
+
+      ctx.strokeStyle='#fbf8f1';
+      ctx.lineWidth=2;
+      ctx.beginPath();
+      ctx.moveTo(plotL-4, y(s.cur)); ctx.lineTo(plotL+plotW+4, y(s.cur));
+      ctx.stroke();
+
+      ctx.textAlign='center';
+      ctx.fillStyle='#f2e7d6';
+      ctx.font=`700 22px ${DISPLAY}`;
+      ctx.fillText(String(s.cur), p.cx, top-14);
+
+      ctx.fillStyle='rgba(242,231,214,.7)';
+      const lw=capsWidth(ctx,p.label,9,1.3);
+      ctx.textAlign='left';
+      caps(ctx,p.label,p.cx-lw/2,bot+22,9,1.3);
+    }
+  }
+
+  function drawPrompt(){
+    const player = agents.find(a=>a.player);
+    const label = isFirstRound() ? 'START' : 'NEXT ROUND';
+    ctx.font='700 15px system-ui';
+    const w = Math.max(128, ctx.measureText(label).width+46), h=38;
+    const px = clamp((player?player.x:W/2)-w/2, 12, W-w-12);
+    const py = clamp((player?player.y:H/2)-h/2-34, fieldTop+10, H-h-12);
+
+    hotspots.push({x:px,y:py,w,h,act:beginRound});
+
+    ctx.save();
+    ctx.shadowColor='rgba(0,0,0,.35)'; ctx.shadowBlur=10; ctx.shadowOffsetY=2;
+    ctx.fillStyle='#1f6feb';
+    ctx.beginPath();
+    if(ctx.roundRect) ctx.roundRect(px,py,w,h,10); else ctx.rect(px,py,w,h);
+    ctx.fill();
+    ctx.restore();
+
+    ctx.fillStyle='#fff';
+    ctx.textAlign='center';
+    ctx.font='700 15px system-ui';
+    ctx.fillText(label, px+w/2, py+18);
+    ctx.font='600 10px system-ui';
+    ctx.fillStyle='rgba(255,255,255,.8)';
+    ctx.fillText('or press space', px+w/2, py+31);
+
+    if(statusText){
+      ctx.font='600 13px system-ui';
+      const tw=ctx.measureText(statusText).width;
+      const tx=clamp(px+w/2, tw/2+16, W-tw/2-16);
+      const ty=clamp(py+h+24, fieldTop+30, H-14);
+      ctx.fillStyle='rgba(27,31,24,.82)';
+      ctx.beginPath();
+      if(ctx.roundRect) ctx.roundRect(tx-tw/2-12, ty-16, tw+24, 24, 8);
+      else ctx.rect(tx-tw/2-12, ty-16, tw+24, 24);
+      ctx.fill();
+      ctx.fillStyle='#f2e7d6';
+      ctx.fillText(statusText, tx, ty);
+    }
+  }
+
+  function drawAgent(a){
+    const moving = Math.hypot(a.vx,a.vy) > 12 && running && !awaitingStart;
+    const bob = moving ? Math.sin(clock*13 + a.id)*1.6 : 0;
+    const lean = moving ? clamp(a.vy/900, -.16, .16) : 0;
+    const scale = 1 + a.pop*0.35;
+
+    // shadow stays on the ground, unaffected by the bob
+    ctx.save();
+    ctx.translate(a.x, a.y);
+    ctx.fillStyle='rgba(38,44,28,.20)';
+    ctx.beginPath();
+    ctx.ellipse(0, 2, 13*scale, 4.2*scale, 0, 0, Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+
+    ctx.save();
+    ctx.translate(a.x, a.y + bob);
+    ctx.rotate(lean*a.face);
+    ctx.scale(a.face*scale, scale);
+
+    if(a.type==='deer'){
+      ctx.fillStyle = a.caught ? '#b08a63' : '#9a6b42';
+      ctx.strokeStyle = a.caught ? '#b08a63' : '#63401f';
+      deerPath(ctx);
+      deerAntlers(ctx);
+    } else {
+      const spent = a.catches>=1;
+      ctx.fillStyle = spent ? '#767d89' : '#525863';
+      wolfPath(ctx);
+    }
+    ctx.restore();
+
+    if(a.player){
+      ctx.save();
+      ctx.translate(a.x, a.y - 9);
+      // during the count the ring pulses hard, so you can find yourself
+      const pulse = countdown>0 ? 1 + 0.5*Math.abs(Math.sin(clock*4.2)) : 1;
+      ctx.strokeStyle='rgba(31,111,235,.95)';
+      ctx.lineWidth=2.5;
+      ctx.beginPath(); ctx.arc(0,0,21*pulse,0,Math.PI*2); ctx.stroke();
+      ctx.strokeStyle='rgba(255,255,255,.55)';
+      ctx.lineWidth=1;
+      ctx.beginPath(); ctx.arc(0,0,23.5*pulse,0,Math.PI*2); ctx.stroke();
+      if(countdown>0){
+        ctx.globalAlpha=0.30;
+        ctx.fillStyle='#1f6feb';
+        ctx.beginPath(); ctx.arc(0,0,21*pulse,0,Math.PI*2); ctx.fill();
+      }
+      ctx.restore();
+    }
+  }
+
+  function drawPuffs(){
+    for(const p of puffs){
+      const k=p.t/0.6;
+      ctx.save();
+      ctx.globalAlpha=(1-k)*0.55;
+      ctx.strokeStyle='#fbf6e6';
+      ctx.lineWidth=2.5*(1-k)+0.5;
+      ctx.beginPath();
+      ctx.arc(p.x,p.y,6+26*k,0,Math.PI*2);
+      ctx.stroke();
+      ctx.fillStyle='rgba(210,200,170,.6)';
+      for(let i=0;i<5;i++){
+        const ang=i*1.27+p.t*2;
+        ctx.beginPath();
+        ctx.arc(p.x+Math.cos(ang)*(8+22*k), p.y+Math.sin(ang)*(5+13*k), 3.2*(1-k)+0.6, 0, Math.PI*2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+  }
+
+  function bigSilhouette(x,y,s,kind){
+    ctx.save();
+    ctx.translate(x,y);
+    ctx.scale(s,s);
+    ctx.fillStyle='#1d2129';
+    ctx.strokeStyle='#1d2129';
+    if(kind==='wolf') wolfPath(ctx); else { deerPath(ctx); deerAntlers(ctx); }
+    ctx.restore();
+  }
+
+  function drawTitleCard(){
+    const fh=H-fieldTop;
+    hotspots.push({x:0,y:fieldTop,w:W,h:fh,act:beginRound});
+
+    ctx.save();
+    ctx.fillStyle='rgba(24,28,20,.64)';
+    ctx.fillRect(0,fieldTop,W,fh);
+
+    // a ridge for the wolf to stand on
+    ctx.fillStyle='rgba(16,20,14,.85)';
+    ctx.beginPath();
+    ctx.moveTo(0,H);
+    ctx.lineTo(0,H-64);
+    ctx.bezierCurveTo(W*0.25,H-96, W*0.62,H-54, W,H-88);
+    ctx.lineTo(W,H);
+    ctx.closePath();
+    ctx.fill();
+    bigSilhouette(W*0.74, H-82, 1.8, 'wolf');
+
+    const cy=fieldTop+fh*0.38;
+    ctx.textAlign='center';
+    ctx.fillStyle='#f7f2e4';
+    ctx.font=`600 58px ${DISPLAY}`;
+    ctx.fillText('Deer and Wolves', W/2, cy);
+
+    ctx.fillStyle='rgba(247,242,228,.82)';
+    ctx.font=`19px ${DISPLAY}`;
+    ctx.fillText('How a population rises, crashes, and comes back.', W/2, cy+32);
+
+    ctx.fillStyle='rgba(247,242,228,.55)';
+    ctx.font='12px system-ui';
+    ctx.fillText('drag to run  ·  or WASD  ·  space to start', W/2, cy+56);
+
+    const pulse=0.7+0.3*Math.sin(clock*2.6);
+    ctx.globalAlpha=pulse;
+    ctx.fillStyle='#f7f2e4';
+    ctx.textAlign='left';
+    caps(ctx,'PRESS  START', W/2-capsWidth(ctx,'PRESS  START',17,1.4)/2, cy+100, 17, 1.4);
+    ctx.restore();
+  }
+
+  function draw(){
+    hotspots = [];
+    drawField();
+    drawPens();
+
+    ctx.fillStyle='rgba(40,48,32,.5)';
+    ctx.font=`600 14px ${DISPLAY}`;
+    ctx.textAlign='center';
+    ctx.fillText(direction===1 ? 'RUN  →' : '←  RUN', W/2, fieldTop+19);
+
+    for(const a of agents) if(a.type==='wolf') drawAgent(a);
+    for(const a of agents) if(a.type==='deer') drawAgent(a);
+    drawPuffs();
+
+    if(countdown>0){
+      const me = agents.find(a=>a.player);
+      const n = Math.ceil(countdown);
+      const t = 1-(countdown-Math.floor(countdown));     // 0..1 within this second
+      const cx = clamp(me?me.x:W/2, margin+40, W-margin-40);
+      const cy = clamp((me?me.y:H/2)-64, fieldTop+44, H-40);
+      ctx.save();
+      ctx.textAlign='center';
+      ctx.globalAlpha = 0.25+0.75*(1-t);
+      ctx.font=`700 ${52+18*(1-t)}px ${DISPLAY}`;
+      ctx.fillStyle='#fbf8f1';
+      ctx.strokeStyle='rgba(20,26,18,.55)';
+      ctx.lineWidth=4;
+      ctx.strokeText(String(n), cx, cy);
+      ctx.fillText(String(n), cx, cy);
+      ctx.globalAlpha=0.85;
+      ctx.font='700 11px system-ui';
+      ctx.fillStyle='#fbf8f1';
+      ctx.strokeText('THIS IS YOU', cx, cy+18);
+      ctx.fillText('THIS IS YOU', cx, cy+18);
+      ctx.restore();
+    }
+
+    if(awaitingStart){
+      if(isFirstRound()){
+        drawTitleCard();
+      } else {
+        drawPrompt();   // no shade: it made the charts at each end unreadable
+      }
+    }
+
+    drawScoreboard();   // last, so nothing can cover the strip
+  }
+
+  // Everything the chart knows about one population, over every round played.
+  function stats(key){
+    const v = history.map(h=>h[key]);
+    const n = v.length;
+    const mean = v.reduce((a,b)=>a+b,0)/n;
+    const sd = Math.sqrt(v.reduce((a,b)=>a+(b-mean)*(b-mean),0)/n);
+    return {cur:v[n-1], max:Math.max(...v), min:Math.min(...v), mean, sd, n};
+  }
+
+
+  function loop(now){
+    const dt=Math.min(.035,(now-lastTime)/1000);
+    lastTime=now;
+    update(dt);
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  setupGame();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
